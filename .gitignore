@@ -51,3 +51,7 @@ sample_data/
 
 # Tesseract data (if any)
 tessdata/
+
+*.jpg
+*.png
+*.pptx
