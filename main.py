@@ -26,13 +26,12 @@ from PySide6.QtGui import QPixmap, QDrag
 CONFIG_FILE = "vna_config.json"
 
 # ==========================================
-# 模块 1: RapidOCR 图像处理与提取模块 (引入三级漏斗搜索策略)
+# 模块 1: RapidOCR 图像处理与提取模块
 # ==========================================
 class VNAOCRExtractor:
     def __init__(self):
         self.ocr = RapidOCR()
         self.target_freqs =[1.5, 3.0, 4.5]
-        # 增强型正则：容忍 GHz 和 dB 之间有至多 25 个乱码/空格字符
         self.pattern = re.compile(r'(\d+\.\d+)\s*[Gg][Hh][Zz][^\d-]{0,25}(-?\d+\.\d+)\s*[dD][Bb]')
 
     def process_image(self, img_path):
@@ -49,21 +48,16 @@ class VNAOCRExtractor:
 
         h, w = img.shape[:2]
         
-        # 【策略 1】: 默认 80% 极速定位区域 (右上角)
         crop_default = img[int(h * 0.10):int(h * 0.28), int(w * 0.65):int(w * 0.88)]
         res_default = self._extract(crop_default)
         if self._is_complete(res_default):
             return res_default
             
-        # 【策略 2】: 20% 偏移定位区域 (应对右侧菜单展开，数据向左挤压)
-        # 扫描区域：宽度 35% ~ 80%，高度 5% ~ 35%
         crop_shifted = img[int(h * 0.05):int(h * 0.35), int(w * 0.35):int(w * 0.80)]
         res_shifted = self._extract(crop_shifted)
         if self._has_any_data(res_shifted):
             return res_shifted
             
-        # 【策略 3】: 极端罕见情况的全面撒网
-        # 扫描整个屏幕的上半区
         crop_extreme = img[0:int(h * 0.50), 0:w]
         return self._extract(crop_extreme)
 
@@ -71,7 +65,6 @@ class VNAOCRExtractor:
         result, _ = self.ocr(crop)
         text_content = ""
         
-        # 信任 OCR 的自然阅读顺序（从上到下，从左到右），合并所有断裂的文本框
         if result:
             for line in result:
                 text_content += str(line[1]) + " "
@@ -85,7 +78,6 @@ class VNAOCRExtractor:
                 db_val = f"{float(match[1]):.2f}dB" 
                 closest_freq = min(self.target_freqs, key=lambda x: abs(x - freq))
                 if abs(closest_freq - freq) < 0.2:
-                    # 【核心抗干扰】：先到先得。由于从上往下读，程序必然先抓到处于最上方的激活 Trace
                     if results[closest_freq] == "N/A":
                         results[closest_freq] = db_val
             except ValueError:
@@ -93,15 +85,13 @@ class VNAOCRExtractor:
         return results
 
     def _is_complete(self, res):
-        """判断是否完美抓齐了 3 个频点"""
         return sum(1 for v in res.values() if v != "N/A") == len(self.target_freqs)
         
     def _has_any_data(self, res):
-        """判断是否至少抓到了 1 个有效频点"""
         return sum(1 for v in res.values() if v != "N/A") > 0
 
 # ==========================================
-# 模块 2: PPT 报告生成模块 (自动分页及排版不改变)
+# 模块 2: PPT 报告生成模块 (中英双语)
 # ==========================================
 class PPTGenerator:
     def __init__(self, output_path):
@@ -110,7 +100,7 @@ class PPTGenerator:
         self.prs.slide_width = Inches(16)
         self.prs.slide_height = Inches(9)
 
-    def generate(self, dataset, proj_name="", spec=""):
+    def generate(self, dataset, proj_name="", spec="", lang="en"):
         blank_layout = self.prs.slide_layouts[6] 
 
         dark_blue = RGBColor(68, 114, 196)   
@@ -119,6 +109,9 @@ class PPTGenerator:
         white = RGBColor(255, 255, 255)
         black = RGBColor(0, 0, 0)
         gray = RGBColor(127, 140, 141)
+
+        lbl_proj = "Project:" if lang == "en" else "项目名:"
+        lbl_spec = "Spec:" if lang == "en" else "规格:"
 
         def format_cell(cell, text, bg_color, font_color, is_bold=False):
             cell.text = str(text)
@@ -133,6 +126,9 @@ class PPTGenerator:
 
         for sample_name, df in dataset.items():
             if df.empty: continue
+            
+            if lang == "en":
+                sample_name = sample_name.replace("样品", "Sample ")
             
             chunk_size = 7
             chunks = [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
@@ -149,7 +145,7 @@ class PPTGenerator:
                     info_box = slide.shapes.add_textbox(Inches(0.5), info_top, Inches(15), info_height)
                     tf = info_box.text_frame
                     tf.word_wrap = True 
-                    tf.text = f"项目名: {proj_name}      规格: {spec}"
+                    tf.text = f"{lbl_proj} {proj_name}      {lbl_spec} {spec}"
                     
                     for p_info in tf.paragraphs:
                         p_info.font.size = Pt(13)
@@ -160,13 +156,15 @@ class PPTGenerator:
 
                 title_box = slide.shapes.add_textbox(Inches(0.5), title_top, Inches(15), Inches(0.5))
                 p = title_box.text_frame.paragraphs[0]
-                suffix = f" (续{chunk_idx})" if chunk_idx > 0 else ""
+                
+                lbl_suffix = f" (Cont.{chunk_idx})" if lang == "en" else f" (续{chunk_idx})"
+                suffix = lbl_suffix if chunk_idx > 0 else ""
+                
                 p.text = sample_name + suffix
                 p.font.size = Pt(24)
                 p.font.bold = True
 
                 table_top = title_top + Inches(0.6)
-                
                 rows = len(chunk_df) + 1 
                 cols = 9
                 header_height = Pt(45) 
@@ -203,7 +201,11 @@ class PPTGenerator:
                     row_idx = idx + 1 
                     row_bg = row_bg_1 if row_idx % 2 == 1 else row_bg_2
                     
-                    format_cell(table.cell(row_idx, 0), row_data['PointName'], row_bg, black, is_bold=True)
+                    pt_name = row_data['PointName']
+                    if lang == "en":
+                        pt_name = pt_name.replace("点位", "Point ")
+                        
+                    format_cell(table.cell(row_idx, 0), pt_name, row_bg, black, is_bold=True)
                     
                     format_cell(table.cell(row_idx, 1), row_data['1.5G_IL'], row_bg, black)
                     format_cell(table.cell(row_idx, 2), row_data['3.0G_IL'], row_bg, black)
@@ -240,7 +242,7 @@ class PPTGenerator:
         slide.shapes.add_picture(img_path, offset_x, offset_y, fit_w, fit_h)
 
 # ==========================================
-# 模块 3: 自定义 UI 组件 (支持相互拖动互换)
+# 模块 3: 自定义 UI 组件 (支持相互拖动互换 + 一键删除)
 # ==========================================
 class ImageCell(QLabel):
     imageLoaded = Signal(str)
@@ -251,6 +253,31 @@ class ImageCell(QLabel):
         self.image_path = ""
         self.setAcceptDrops(True)
         self.drag_start_pos = None
+        
+        self.btn_layout = QVBoxLayout(self)
+        self.btn_layout.setContentsMargins(5, 5, 5, 5)
+        # 【修改点】修正为 Qt.AlignTop | Qt.AlignRight
+        self.btn_layout.setAlignment(Qt.AlignTop | Qt.AlignRight)
+        
+        self.btn_delete = QPushButton("×")
+        self.btn_delete.setFixedSize(22, 22)
+        self.btn_delete.setCursor(Qt.PointingHandCursor)
+        self.btn_delete.setStyleSheet("""
+            QPushButton {
+                background-color: #E74C3C;
+                color: white;
+                border-radius: 11px;
+                font-weight: bold;
+                font-family: Arial;
+                font-size: 14px;
+                padding-bottom: 2px;
+            }
+            QPushButton:hover { background-color: #C0392B; }
+        """)
+        self.btn_delete.clicked.connect(self.clear_image)
+        self.btn_delete.hide()
+        
+        self.btn_layout.addWidget(self.btn_delete)
         self.reset_ui()
 
     def reset_ui(self):
@@ -320,11 +347,13 @@ class ImageCell(QLabel):
         pixmap = QPixmap(self.image_path)
         self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.setStyleSheet("border: none; background-color: transparent; margin: 4px;")
+        self.btn_delete.show() 
         self.imageLoaded.emit(self.image_path)
 
     def clear_image(self):
         self.image_path = ""
         self.setPixmap(QPixmap())
+        self.btn_delete.hide() 
         self.reset_ui()
 
 # ==========================================
@@ -540,6 +569,12 @@ class MainWindow(QMainWindow):
         top_layout = QHBoxLayout(top_card)
         top_layout.setContentsMargins(20, 15, 20, 15)
         
+        lbl_lang = QLabel("报告语言 :")
+        lbl_lang.setObjectName("InfoTitle")
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItems(["English", "中文"])
+        self.combo_lang.setFocusPolicy(Qt.NoFocus)
+
         lbl_proj = QLabel("项目名 :")
         lbl_proj.setObjectName("InfoTitle")
         self.edit_proj = QLineEdit()
@@ -553,11 +588,14 @@ class MainWindow(QMainWindow):
         self.combo_spec.setPlaceholderText("请选择或手动输入规格")
         self.combo_spec.addItems(list(set(self.config_map.values())))
 
+        top_layout.addWidget(lbl_lang)
+        top_layout.addWidget(self.combo_lang, stretch=1)
+        top_layout.addSpacing(20)
         top_layout.addWidget(lbl_proj)
         top_layout.addWidget(self.edit_proj, stretch=2)
-        top_layout.addSpacing(30)
+        top_layout.addSpacing(20)
         top_layout.addWidget(lbl_spec)
-        top_layout.addWidget(self.combo_spec, stretch=3)
+        top_layout.addWidget(self.combo_spec, stretch=2)
         main_layout.addWidget(top_card)
 
         self.tabs = QTabWidget()
@@ -651,6 +689,8 @@ class MainWindow(QMainWindow):
 
     def start_ocr_task(self, ui_data, mode):
         self.mode = mode
+        self.current_lang = "en" if self.combo_lang.currentText() == "English" else "zh"
+        
         self.progress_dialog = QProgressDialog("正在通过 RapidOCR 极速提取数据...", "取消", 0, 100, self)
         self.progress_dialog.setWindowTitle("处理中")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -670,7 +710,12 @@ class MainWindow(QMainWindow):
         elif self.mode == "export":
             try:
                 ppt_gen = PPTGenerator(self.save_path)
-                ppt_gen.generate(result_dataset, self.edit_proj.text().strip(), self.combo_spec.currentText().strip())
+                ppt_gen.generate(
+                    result_dataset, 
+                    proj_name=self.edit_proj.text().strip(), 
+                    spec=self.combo_spec.currentText().strip(),
+                    lang=self.current_lang 
+                )
                 QMessageBox.information(self, "成功", f"PPT已成功导出至:\n{self.save_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"PPT生成失败: {str(e)}")
