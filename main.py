@@ -26,18 +26,19 @@ from PySide6.QtGui import QPixmap, QDrag
 CONFIG_FILE = "vna_config.json"
 
 # ==========================================
-# 模块 1: RapidOCR 图像处理与提取模块
+# 模块 1: RapidOCR 图像处理与提取模块 (引入三级漏斗搜索策略)
 # ==========================================
 class VNAOCRExtractor:
     def __init__(self):
         self.ocr = RapidOCR()
         self.target_freqs =[1.5, 3.0, 4.5]
+        # 增强型正则：容忍 GHz 和 dB 之间有至多 25 个乱码/空格字符
+        self.pattern = re.compile(r'(\d+\.\d+)\s*[Gg][Hh][Zz][^\d-]{0,25}(-?\d+\.\d+)\s*[dD][Bb]')
 
     def process_image(self, img_path):
         if not img_path or not os.path.exists(img_path):
             return {1.5: "N/A", 3.0: "N/A", 4.5: "N/A"}
 
-        # 【核心修复】使用 numpy 读取字节流，完美支持中文路径
         try:
             img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         except Exception:
@@ -47,19 +48,36 @@ class VNAOCRExtractor:
             return {1.5: "N/A", 3.0: "N/A", 4.5: "N/A"}
 
         h, w = img.shape[:2]
-        crop = img[int(h * 0.10):int(h * 0.28), int(w * 0.65):int(w * 0.88)]
-        result, _ = self.ocr(crop)
         
+        # 【策略 1】: 默认 80% 极速定位区域 (右上角)
+        crop_default = img[int(h * 0.10):int(h * 0.28), int(w * 0.65):int(w * 0.88)]
+        res_default = self._extract(crop_default)
+        if self._is_complete(res_default):
+            return res_default
+            
+        # 【策略 2】: 20% 偏移定位区域 (应对右侧菜单展开，数据向左挤压)
+        # 扫描区域：宽度 35% ~ 80%，高度 5% ~ 35%
+        crop_shifted = img[int(h * 0.05):int(h * 0.35), int(w * 0.35):int(w * 0.80)]
+        res_shifted = self._extract(crop_shifted)
+        if self._has_any_data(res_shifted):
+            return res_shifted
+            
+        # 【策略 3】: 极端罕见情况的全面撒网
+        # 扫描整个屏幕的上半区
+        crop_extreme = img[0:int(h * 0.50), 0:w]
+        return self._extract(crop_extreme)
+
+    def _extract(self, crop):
+        result, _ = self.ocr(crop)
         text_content = ""
+        
+        # 信任 OCR 的自然阅读顺序（从上到下，从左到右），合并所有断裂的文本框
         if result:
             for line in result:
                 text_content += str(line[1]) + " "
-        return self._parse_text(text_content)
-
-    def _parse_text(self, text):
+                
         results = {1.5: "N/A", 3.0: "N/A", 4.5: "N/A"}
-        pattern = re.compile(r'(\d+\.\d+)\s*[Gg][Hh][Zz][^\d-]{0,10}(-?\d+\.\d+)\s*[dD][Bb]')
-        matches = pattern.findall(text)
+        matches = self.pattern.findall(text_content)
         
         for match in matches:
             try:
@@ -67,14 +85,23 @@ class VNAOCRExtractor:
                 db_val = f"{float(match[1]):.2f}dB" 
                 closest_freq = min(self.target_freqs, key=lambda x: abs(x - freq))
                 if abs(closest_freq - freq) < 0.2:
+                    # 【核心抗干扰】：先到先得。由于从上往下读，程序必然先抓到处于最上方的激活 Trace
                     if results[closest_freq] == "N/A":
                         results[closest_freq] = db_val
             except ValueError:
                 continue
         return results
 
+    def _is_complete(self, res):
+        """判断是否完美抓齐了 3 个频点"""
+        return sum(1 for v in res.values() if v != "N/A") == len(self.target_freqs)
+        
+    def _has_any_data(self, res):
+        """判断是否至少抓到了 1 个有效频点"""
+        return sum(1 for v in res.values() if v != "N/A") > 0
+
 # ==========================================
-# 模块 2: PPT 报告生成模块
+# 模块 2: PPT 报告生成模块 (自动分页及排版不改变)
 # ==========================================
 class PPTGenerator:
     def __init__(self, output_path):
@@ -106,62 +133,89 @@ class PPTGenerator:
 
         for sample_name, df in dataset.items():
             if df.empty: continue
-            slide = self.prs.slides.add_slide(blank_layout)
             
-            if proj_name or spec:
-                info_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.15), Inches(15), Inches(0.4))
-                tf = info_box.text_frame
-                tf.text = f"项目名: {proj_name}      规格: {spec}"
-                tf.paragraphs[0].font.size = Pt(13)
-                tf.paragraphs[0].font.bold = True
-                tf.paragraphs[0].font.color.rgb = gray
-
-            title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.45), Inches(15), Inches(0.5))
-            p = title_box.text_frame.paragraphs[0]
-            p.text = sample_name
-            p.font.size = Pt(24)
-            p.font.bold = True
-
-            rows = len(df) + 1 
-            cols = 9
+            chunk_size = 7
+            chunks = [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
             
-            header_height = Pt(45) 
-            data_row_height = Inches(1.8) 
-            total_height = header_height + (data_row_height * len(df))
-
-            left, top, width = Inches(0.5), Inches(1.0), Inches(15)
-            table_shape = slide.shapes.add_table(rows, cols, left, top, width, total_height)
-            table = table_shape.table
-            
-            table.rows[0].height = header_height
-            for i in range(1, rows): table.rows[i].height = data_row_height
-
-            table.columns[0].width = Inches(1.0)
-            for i in[1, 2, 3, 5, 6, 7]: table.columns[i].width = Inches(1.3)
-            for i in [4, 8]: table.columns[i].width = Inches(3.1)
-
-            headers =["Items", "1.500GHz(IL)", "3.000GHz(IL)", "4.500GHz(IL)", "Image", 
-                       "1.500GHz(RL)", "3.000GHz(RL)", "4.500GHz(RL)", "Image"]
-            for col_idx, header in enumerate(headers):
-                format_cell(table.cell(0, col_idx), header, dark_blue, white, is_bold=True)
-
-            for idx, (index, row_data) in enumerate(df.iterrows()):
-                row_idx = idx + 1 
-                row_bg = row_bg_1 if row_idx % 2 == 1 else row_bg_2
+            for chunk_idx, chunk_df in enumerate(chunks):
+                slide = self.prs.slides.add_slide(blank_layout)
                 
-                format_cell(table.cell(row_idx, 0), row_data['PointName'], row_bg, black, is_bold=True)
+                info_top = Inches(0.15)
+                newlines = max(proj_name.count('\n'), spec.count('\n'))
+                info_height = Inches(0.3) + newlines * Inches(0.2)
                 
-                format_cell(table.cell(row_idx, 1), row_data['1.5G_IL'], row_bg, black)
-                format_cell(table.cell(row_idx, 2), row_data['3.0G_IL'], row_bg, black)
-                format_cell(table.cell(row_idx, 3), row_data['4.5G_IL'], row_bg, black)
-                format_cell(table.cell(row_idx, 4), "", row_bg, black) 
-                self._insert_image_to_cell(slide, table_shape, row_idx, 4, row_data['Img_IL'])
+                if proj_name or spec:
+                    title_top = info_top + info_height + Inches(0.05)
+                    info_box = slide.shapes.add_textbox(Inches(0.5), info_top, Inches(15), info_height)
+                    tf = info_box.text_frame
+                    tf.word_wrap = True 
+                    tf.text = f"项目名: {proj_name}      规格: {spec}"
+                    
+                    for p_info in tf.paragraphs:
+                        p_info.font.size = Pt(13)
+                        p_info.font.bold = True
+                        p_info.font.color.rgb = gray
+                else:
+                    title_top = Inches(0.2)
+
+                title_box = slide.shapes.add_textbox(Inches(0.5), title_top, Inches(15), Inches(0.5))
+                p = title_box.text_frame.paragraphs[0]
+                suffix = f" (续{chunk_idx})" if chunk_idx > 0 else ""
+                p.text = sample_name + suffix
+                p.font.size = Pt(24)
+                p.font.bold = True
+
+                table_top = title_top + Inches(0.6)
                 
-                format_cell(table.cell(row_idx, 5), row_data['1.5G_RL'], row_bg, black)
-                format_cell(table.cell(row_idx, 6), row_data['3.0G_RL'], row_bg, black)
-                format_cell(table.cell(row_idx, 7), row_data['4.5G_RL'], row_bg, black)
-                format_cell(table.cell(row_idx, 8), "", row_bg, black) 
-                self._insert_image_to_cell(slide, table_shape, row_idx, 8, row_data['Img_RL'])
+                rows = len(chunk_df) + 1 
+                cols = 9
+                header_height = Pt(45) 
+                
+                max_bottom_margin = Inches(8.5) 
+                max_table_height = max_bottom_margin - table_top
+                
+                if len(chunk_df) <= 4:
+                    data_row_height = Inches(1.6) 
+                    total_height = header_height + (data_row_height * len(chunk_df))
+                else:
+                    available_data_height = max_table_height - header_height
+                    data_row_height = int(available_data_height / len(chunk_df))
+                    total_height = max_table_height
+
+                left, width = Inches(0.5), Inches(15)
+                table_shape = slide.shapes.add_table(rows, cols, left, table_top, width, total_height)
+                table = table_shape.table
+                
+                table.rows[0].height = header_height
+                for i in range(1, rows): 
+                    table.rows[i].height = int(data_row_height)
+
+                table.columns[0].width = Inches(1.0)
+                for i in[1, 2, 3, 5, 6, 7]: table.columns[i].width = Inches(1.3)
+                for i in [4, 8]: table.columns[i].width = Inches(3.1)
+
+                headers =["Items", "1.500GHz(IL)", "3.000GHz(IL)", "4.500GHz(IL)", "Image", 
+                           "1.500GHz(RL)", "3.000GHz(RL)", "4.500GHz(RL)", "Image"]
+                for col_idx, header in enumerate(headers):
+                    format_cell(table.cell(0, col_idx), header, dark_blue, white, is_bold=True)
+
+                for idx, (index, row_data) in enumerate(chunk_df.iterrows()):
+                    row_idx = idx + 1 
+                    row_bg = row_bg_1 if row_idx % 2 == 1 else row_bg_2
+                    
+                    format_cell(table.cell(row_idx, 0), row_data['PointName'], row_bg, black, is_bold=True)
+                    
+                    format_cell(table.cell(row_idx, 1), row_data['1.5G_IL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 2), row_data['3.0G_IL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 3), row_data['4.5G_IL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 4), "", row_bg, black) 
+                    self._insert_image_to_cell(slide, table_shape, row_idx, 4, row_data['Img_IL'])
+                    
+                    format_cell(table.cell(row_idx, 5), row_data['1.5G_RL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 6), row_data['3.0G_RL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 7), row_data['4.5G_RL'], row_bg, black)
+                    format_cell(table.cell(row_idx, 8), "", row_bg, black) 
+                    self._insert_image_to_cell(slide, table_shape, row_idx, 8, row_data['Img_RL'])
 
         self.prs.save(self.output_path)
 
@@ -190,7 +244,7 @@ class PPTGenerator:
 # ==========================================
 class ImageCell(QLabel):
     imageLoaded = Signal(str)
-    filesDroppedToTab = Signal(list) # 将多文件拖拽向上传递给父组件
+    filesDroppedToTab = Signal(list) 
 
     def __init__(self):
         super().__init__()
@@ -219,7 +273,6 @@ class ImageCell(QLabel):
     def mouseMoveEvent(self, event):
         if not self.drag_start_pos or not self.image_path:
             return
-        # 拖拽距离超过判定阈值，触发拖拽对象交换
         if (event.position().toPoint() - self.drag_start_pos).manhattanLength() > QApplication.startDragDistance():
             drag = QDrag(self)
             mime = QMimeData()
@@ -230,7 +283,6 @@ class ImageCell(QLabel):
             self.drag_start_pos = None
 
     def mouseReleaseEvent(self, event):
-        # 如果只是单纯的点击(未移动)，则开启文件选择
         if self.drag_start_pos is not None:
             path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg)")
             if path: self.load_image(path)
@@ -242,7 +294,6 @@ class ImageCell(QLabel):
 
     def dropEvent(self, event):
         source = event.source()
-        # 1. 如果是从同软件的另一个单元格拖过来的，进行路径内容【交换】
         if isinstance(source, ImageCell) and source != self:
             source_path = source.image_path
             target_path = self.image_path
@@ -255,15 +306,12 @@ class ImageCell(QLabel):
             
             event.acceptProposedAction()
             
-        # 2. 如果是从外部资源管理器拖进来的
         elif event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if len(urls) == 1 and Path(urls[0].toLocalFile()).is_file():
-                # 仅拖了一张图，直接填入当前格子
                 self.load_image(urls[0].toLocalFile())
                 event.acceptProposedAction()
             else:
-                # 拖了一堆图或文件夹，上交给 Tab 面板进行智能全量解析
                 self.filesDroppedToTab.emit(urls)
                 event.acceptProposedAction()
 
@@ -351,7 +399,7 @@ class SampleTab(QWidget):
         
         il_cell = ImageCell()
         il_cell.imageLoaded.connect(lambda path, r=row: self.auto_fill_point_name(r, path))
-        il_cell.filesDroppedToTab.connect(self.handle_dropped_files) # 监听批量的拖拽
+        il_cell.filesDroppedToTab.connect(self.handle_dropped_files) 
         self.table.setCellWidget(row, 1, il_cell)
         
         rl_cell = ImageCell()
@@ -366,14 +414,12 @@ class SampleTab(QWidget):
 
     def auto_fill_point_name(self, row, path):
         stem = Path(path).stem
-        # 智能剥离末尾无用特征，如 -1, _IL, _RL 等
         clean_name = re.sub(r'[-_]([iI][lL]|[rR][lL]|\d+)$', '', stem)
         edit_widget = self.table.cellWidget(row, 0)
         current_text = edit_widget.text().strip()
         if current_text.startswith("点位") or not current_text:
             edit_widget.setText(clean_name)
 
-    # ====== 【核心】无死角智能配对引擎 ======
     def handle_dropped_files(self, urls):
         files =[]
         for url in urls:
@@ -387,7 +433,6 @@ class SampleTab(QWidget):
         groups = defaultdict(list)
         for f in img_files:
             stem = Path(f).stem
-            # 去除常见标识符后作为分组基准, 例如: '0P_1' -> '0P'
             base_name = re.sub(r'[-_]([iI][lL]|[rR][lL]|\d+)$', '', stem)
             groups[base_name].append(f)
 
@@ -397,7 +442,6 @@ class SampleTab(QWidget):
         for base, f_list in groups.items():
             f_list = sorted(f_list)
             
-            # 内部进行一下简单排序，如果是明显的 IL 和 RL 让其就位
             def intelligent_sort(x):
                 xl = x.lower()
                 if 'il' in xl and 'rl' not in xl: return 0
@@ -405,15 +449,12 @@ class SampleTab(QWidget):
                 return 1
             f_list.sort(key=intelligent_sort)
 
-            # 两两凑对 (如同名文件达到两个以上)
             while len(f_list) >= 2:
                 final_pairs.append((base, f_list[0], f_list[1]))
                 f_list = f_list[2:]
             
-            # 落单文件扔进孤儿院
             if f_list: orphans.extend(f_list)
 
-        # ====== 孤儿院的极限凑对 (无论什么名字，直接按顺序两两捆绑) ======
         orphans = sorted(orphans)
         while len(orphans) >= 2:
             o1, o2 = orphans[0], orphans[1]
@@ -422,7 +463,6 @@ class SampleTab(QWidget):
             final_pairs.append((base, o1, o2))
             orphans = orphans[2:]
 
-        # 填入 UI
         for base, il_path, rl_path in final_pairs:
             row = self.find_empty_row_or_add()
             self.table.cellWidget(row, 0).setText(base)
@@ -457,9 +497,9 @@ class SampleTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VNA Data Automator - RapidOCR & PPTX Edition")
+        self.setWindowTitle("VNA Data Automator")
         self.resize(1000, 780)
-        self.setAcceptDrops(True) # 开启全局掉落
+        self.setAcceptDrops(True) 
         self.config_map = self.load_settings()
         self.init_ui()
         self.apply_styles()
